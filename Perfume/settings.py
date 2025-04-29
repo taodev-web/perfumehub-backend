@@ -165,4 +165,7 @@ MEDIA_ROOT = BASE_DIR / 'media'
 
 
 # Stripe settings
+import os
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
+
 STRIPE_SECRET_KEY = 'sk_test_51RFmOXGhF83rug2m807ltTD2L1Uu1LMQP4wsv4LZqUqRvIh0v3Sc2iDh7RGOxikFbKtZwWR2dtrWuoAdoRHygVIh00vuhLVz9V'
