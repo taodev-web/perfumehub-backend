@@ -1,3 +1,6 @@
+import random
+import string 
+import stripe  
 from rest_framework import generics
 from .models import Product, Category, Order, OrderItem, Review, DeliveryAddress, RefundRequest, ProductImage
 from .serializers import ProductSerializer, CategorySerializer, CartCheckoutSerializer, OrderSerializer, RefundRequestSerializer, RestockSerializer, UpdateOrderStatusSerializer, DeliveryAddressSerializer, CouponSerializer, Coupon, ReviewSerializer, UserRegisterSerializer, UserProfileSerializer, ProductImageSerializer
@@ -11,29 +14,36 @@ from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.permissions import IsAdminUser
+from rest_framework.views import APIView
 from rest_framework.parsers import MultiPartParser, FormParser
 from django.db.models import Sum
 from django.utils.dateparse import parse_date
 from django.core.mail import send_mail
 from django.utils import timezone
-import random
-import string 
-import stripe  # at the top of your views.py
 from django.conf import settings  # if not already importe
 
 
 # This view is for listing all orders for admin users
-class AdminOrderListView(generics.ListAPIView):
-    serializer_class = OrderSerializer
+class AdminOrderListView(APIView):
     permission_classes = [IsAdminUser]
 
-    def get_queryset(self):
-        queryset = Order.objects.all().order_by('-created_at')
-        status_param = self.request.GET.get('status')
-        if status_param:
-            queryset = queryset.filter(status=status_param)
-        return queryset
+    def get(self, request):
+        try:
+            queryset = Order.objects.all().order_by('-created_at')
 
+            # Optional status filter
+            status_param = request.GET.get('status')
+            if status_param:
+                queryset = queryset.filter(status=status_param)
+
+            serializer = OrderSerializer(queryset, many=True)
+            return Response(serializer.data, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            return Response(
+                {"error": f"An error occurred while fetching orders: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
 
 # Cart Checkout API
@@ -41,12 +51,15 @@ class AdminOrderListView(generics.ListAPIView):
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def checkout(request):
-    serializer = CartCheckoutSerializer(data=request.data)
-    if serializer.is_valid():
+    try:
+        serializer = CartCheckoutSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
         items = serializer.validated_data['items']
         total = 0
 
-        # Handle coupon code if provided
+        # Handle coupon
         coupon_code = request.data.get('coupon_code')
         coupon = None
         discount_amount = 0
@@ -62,6 +75,7 @@ def checkout(request):
             except Coupon.DoesNotExist:
                 coupon = None
 
+        # Create order
         order = Order.objects.create(
             user=request.user,
             total_price=0,
@@ -69,20 +83,11 @@ def checkout(request):
             discount_amount=discount_amount
         )
 
+        # Create order items
         for item in items:
             product = Product.objects.get(id=item['product_id'])
             quantity = item['quantity']
             price = product.price * quantity
-
-            # ✅ Check stock threshold and send alert
-            if product.quantity < 5:  # set your threshold here
-                send_mail(
-                subject=f"⚠️ Low Stock Alert: {product.name}",
-                message=f"The stock for {product.name} is running low.\n\nOnly {product.quantity} units remaining.\nConsider restocking soon.",
-                from_email=None,
-                recipient_list=['youremail@gmail.com'],  # replace with your admin email
-                fail_silently=False
-    )
 
             OrderItem.objects.create(
                 order=order,
@@ -94,13 +99,24 @@ def checkout(request):
             product.quantity -= quantity
             product.save()
 
+            # Stock alert
+            if product.quantity < 5:
+                send_mail(
+                    subject=f"⚠️ Low Stock Alert: {product.name}",
+                    message=f"The stock for {product.name} is running low.\n\nOnly {product.quantity} units remaining.\nConsider restocking soon.",
+                    from_email=None,
+                    recipient_list=['youremail@gmail.com'],
+                    fail_silently=False
+                )
+
             total += price
 
+        # Apply discount
         final_total = total - discount_amount
         order.total_price = final_total
         order.save()
 
-        # ✅ Build order summary for email
+        # Build order email
         order_items = OrderItem.objects.filter(order=order)
         item_list = "\n".join(
             [f"- {item.product.name} (x{item.quantity}) - £{item.price}" for item in order_items]
@@ -128,6 +144,7 @@ Thanks for shopping with us!
 PerfumeHub UK Team
 """
 
+        # Send confirmation email
         send_mail(
             subject=f"PerfumeHub Order Confirmation — Order #{order.id}",
             message=order_message,
@@ -136,25 +153,28 @@ PerfumeHub UK Team
             fail_silently=False
         )
 
-        # ✅ Stripe PaymentIntent setup here (after email)
+        # Stripe PaymentIntent
         stripe.api_key = settings.STRIPE_SECRET_KEY
 
         payment_intent = stripe.PaymentIntent.create(
-            amount=int(final_total * 100),  # convert to smallest currency unit (pence)
+            amount=int(final_total * 100),
             currency='gbp',
-            metadata={'order_id': order.id, 'user': request.user.username}
+            metadata={'order_id': str(order.id), 'user': request.user.username}
         )
 
-        # ✅ Final Response with PaymentIntent client secret
         return Response({
             'message': 'Order placed successfully',
-            'order_id': order.id,
+            'order_id': str(order.id),
             'discount_applied': discount_amount,
             'final_total': final_total,
             'payment_client_secret': payment_intent.client_secret
-        })
+        }, status=status.HTTP_201_CREATED)
 
-    return Response(serializer.errors, status=400)
+    except Exception as e:
+        return Response(
+            {'error': str(e)},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
 
 
 
@@ -463,8 +483,19 @@ class DeliveryAddressListCreateView(generics.ListCreateAPIView):
     def get_queryset(self):
         return DeliveryAddress.objects.filter(user=self.request.user)
 
-    def perform_create(self, serializer):
-        serializer.save(user=self.request.user)
+    def create(self, request, *args, **kwargs):
+        try:
+            serializer = self.get_serializer(data=request.data)
+            if serializer.is_valid():
+                serializer.save(user=request.user)
+                return Response(serializer.data, status=status.HTTP_201_CREATED)
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response(
+                {"error": f"Failed to add address: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
 
 # Retrieve, Update, Delete
 class DeliveryAddressDetailView(generics.RetrieveUpdateDestroyAPIView):
@@ -473,6 +504,34 @@ class DeliveryAddressDetailView(generics.RetrieveUpdateDestroyAPIView):
 
     def get_queryset(self):
         return DeliveryAddress.objects.filter(user=self.request.user)
+
+    def update(self, request, *args, **kwargs):
+        try:
+            partial = kwargs.pop('partial', False)
+            instance = self.get_object()
+            serializer = self.get_serializer(instance, data=request.data, partial=partial)
+
+            if serializer.is_valid():
+                serializer.save()
+                return Response(serializer.data, status=status.HTTP_200_OK)
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response(
+                {"error": f"Failed to update address: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+    def destroy(self, request, *args, **kwargs):
+        try:
+            instance = self.get_object()
+            instance.delete()
+            return Response({"message": "Address deleted successfully"}, status=status.HTTP_204_NO_CONTENT)
+        except Exception as e:
+            return Response(
+                {"error": f"Failed to delete address: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
 
 # This is the API for the User Profile
 class UserProfileView(generics.RetrieveUpdateAPIView):
@@ -491,8 +550,19 @@ class RefundRequestListCreateView(generics.ListCreateAPIView):
     def get_queryset(self):
         return RefundRequest.objects.filter(user=self.request.user)
 
-    def perform_create(self, serializer):
-        serializer.save(user=self.request.user)
+    def create(self, request, *args, **kwargs):
+        try:
+            serializer = self.get_serializer(data=request.data)
+            if serializer.is_valid():
+                serializer.save(user=request.user)
+                return Response(serializer.data, status=status.HTTP_201_CREATED)
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response(
+                {"error": f"Failed to submit refund request: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
 
 # Admin: view and update refund status
 class RefundRequestDetailView(generics.RetrieveUpdateAPIView):
@@ -500,6 +570,22 @@ class RefundRequestDetailView(generics.RetrieveUpdateAPIView):
     serializer_class = RefundRequestSerializer
     queryset = RefundRequest.objects.all()
 
+    def update(self, request, *args, **kwargs):
+        try:
+            partial = kwargs.pop('partial', False)
+            instance = self.get_object()
+            serializer = self.get_serializer(instance, data=request.data, partial=partial)
+
+            if serializer.is_valid():
+                serializer.save()
+                return Response(serializer.data, status=status.HTTP_200_OK)
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        except Exception as e:
+            return Response(
+                {"error": f"Failed to update refund status: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
 # This is the API for Product Images
 

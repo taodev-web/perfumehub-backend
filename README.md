@@ -15,6 +15,9 @@ This is the production-ready backend for a real-world perfume e-commerce website
 - ✅ Refund/Return system
 - ✅ Sales reporting for admin
 - ✅ Stock alert email system
+- ✅ UUID-based secure order tracking
+
+
 
 ---
 
